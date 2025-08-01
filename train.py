@@ -1,7 +1,27 @@
+#!/usr/bin/env python3
+"""
+Deep Learning Framework for Type VI Secretion Effector Classification
+
+This script implements a comprehensive evaluation framework for binary classification
+of Type VI Secretion System Effectors (T6SE) versus other secretory proteins using
+transformer-based protein language models.
+
+The evaluation protocol employs stratified k-fold cross-validation with multiple
+independent random sampling iterations to ensure robust performance estimates.
+
+Authors: [Your Name]
+Institution: [Your Institution]
+Date: [Current Date]
+"""
+
 import os
+import sys
 import time
 import logging
-from argparse import ArgumentParser
+import argparse
+from datetime import datetime
+from typing import Tuple, Dict, Any
+import numpy as np
 
 import torch
 import torch.nn as nn
@@ -17,254 +37,516 @@ from esm import Alphabet
 from DeepSecE.model import EffectorTransformer, ESM1bModel
 from DeepSecE.dataset import TXSESequenceDataSet
 from DeepSecE.utils import label2index, viz_conf_matrix
-from DeepSecE.trainer import train, test, set_seed, LearningRateSaturationStopping
+from DeepSecE.trainer import train, test, set_seed, EarlyStopping
 
 
-def get_current_lr(optimizer):
-    """Get current learning rate from optimizer"""
-    for param_group in optimizer.param_groups:
-        return param_group['lr']
-
-
-def run_single_training_iteration(args, iteration_num):
-    """Run a single training iteration with random sampling"""
+def setup_logging(log_dir: str, process_id: int) -> logging.Logger:
+    """
+    Configure logging for the training process.
     
-    # Set different seed for each iteration to ensure different random sampling
-    iteration_seed = args.seed + iteration_num
-    set_seed(iteration_seed)
-
-    # Logging
-    log_dir = os.path.join(args.log_dir, f'Iteration_{iteration_num+1}', f'Fold_{args.fold_num + 1}')
-    os.makedirs(log_dir, exist_ok=True)
-    logging.basicConfig(
-        handlers=[logging.FileHandler(os.path.join(log_dir, "training.log"), mode='w', encoding='utf-8')],
-        format="%(asctime)s %(levelname)s: %(message)s",
-        datefmt="%F %T",
-        level=logging.INFO
-    )
-    writer = SummaryWriter(log_dir)
-
-    logging.info(f"Starting training iteration {iteration_num+1} with seed {iteration_seed}")
-    logging.info(f"Sampling {args.n_t6se_samples} T6SE and {args.n_non_t6se_samples} non-T6SE sequences")
-
-    # Device and model
-    device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
-    if args.model == "effectortransformer":
-        model = EffectorTransformer(1280, 33, hid_dim=args.hid_dim, num_layers=args.num_layers,
-                                    heads=args.num_heads, dropout_rate=args.dropout_rate, num_classes=1)
-    elif args.model == "esm1bmodel":
-        model = ESM1bModel(1280, 33, unfreeze_last=True, hid_dim=args.hid_dim,
-                           dropout_rate=args.dropout_rate, num_classes=1)
-    else:
-        raise ValueError("Invalid model type!")
-    model.to(device)
-
-    # Dataset with random sampling
-    alphabet = Alphabet.from_architecture("roberta_large")
-    train_dataset = TXSESequenceDataSet(
-        t6se_fasta_path=args.t6se_data_path,
-        non_t6se_fasta_path=args.non_t6se_data_path,
-        transform=label2index, 
-        mode='train', 
-        kfold=args.kfold,
-        fold_num=args.fold_num, 
-        seed=iteration_seed,
-        n_t6se_samples=args.n_t6se_samples,
-        n_non_t6se_samples=args.n_non_t6se_samples
-    )
-    
-    valid_dataset = TXSESequenceDataSet(
-        t6se_fasta_path=args.t6se_data_path,
-        non_t6se_fasta_path=args.non_t6se_data_path,
-        transform=label2index, 
-        mode='valid', 
-        kfold=args.kfold,
-        fold_num=args.fold_num, 
-        seed=iteration_seed,
-        n_t6se_samples=args.n_t6se_samples,
-        n_non_t6se_samples=args.n_non_t6se_samples
-    )
-
-    train_loader = DataLoader(train_dataset, batch_size=args.batch_size,
-                              collate_fn=alphabet.get_batch_converter(), 
-                              num_workers=args.num_workers, shuffle=True)
-    valid_loader = DataLoader(valid_dataset, batch_size=args.batch_size,
-                              collate_fn=alphabet.get_batch_converter(), 
-                              num_workers=args.num_workers)
-
-    logging.info(f"Training set size: {len(train_dataset)}")
-    logging.info(f"Validation set size: {len(valid_dataset)}")
-
-    # Loss & Optimizer
-    criterion = nn.BCEWithLogitsLoss()
-    if args.model == "esm1bmodel" and hasattr(model, 'pretrained_model'):
-        optimizer = optim.Adam([
-            {'params': filter(lambda p: p.requires_grad, model.pretrained_model.parameters()), 'lr': args.lr / 10},
-            {'params': model.clf.parameters(), 'lr': args.lr}
-        ], weight_decay=args.weight_decay)
-    else:
-        optimizer = optim.Adam(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
-
-    # Scheduler
-    if args.lr_scheduler is None:
-        scheduler = GradualWarmupScheduler(optimizer, multiplier=1, total_epoch=args.warm_epochs)
-    else:
-        if args.lr_scheduler == 'step':
-            after_scheduler = lrs.StepLR(optimizer, step_size=args.lr_decay_steps, gamma=args.lr_decay_rate)
-        elif args.lr_scheduler == 'cosine':
-            after_scheduler = lrs.CosineAnnealingLR(optimizer, T_max=args.lr_decay_steps, eta_min=args.lr_decay_min_lr)
-        else:
-            raise ValueError("Invalid scheduler type!")
-        scheduler = GradualWarmupScheduler(optimizer, 1, args.warm_epochs, after_scheduler)
-
-    # Learning rate saturation stopping
-    lr_stopping = LearningRateSaturationStopping(
-        patience=args.patience, 
-        min_lr_threshold=args.min_lr_threshold,
-        checkpoint_dir=log_dir
-    )
-
-    # Training Loop
-    best_f1 = 0.0
-    for epoch in range(args.max_epochs):
-        start_time = time.time()
-
-        train_loss, train_acc = train(model, train_loader, criterion, optimizer, device)
-        valid_loss, valid_metrics = test(model, valid_loader, criterion, device)
-
-        current_lr = get_current_lr(optimizer)
-        scheduler.step()
-        epoch_time = time.time() - start_time
-
-        logging.info(f"Epoch {epoch+1:02d} | Time: {epoch_time:.2f}s | LR: {current_lr:.2e}")
-        logging.info(f"Train Loss: {train_loss:.4f} | Acc: {train_acc*100:.2f}%")
-        logging.info(f"Valid Loss: {valid_loss:.4f} | Acc: {valid_metrics['Accuracy']*100:.2f}%")
-        logging.info(f"Valid F1: {valid_metrics['F1-score']:.4f} | AUPRC: {valid_metrics['AUPRC']:.4f}")
-
-        writer.add_scalar("Train/Loss", train_loss, epoch+1)
-        writer.add_scalar("Train/Accuracy", train_acc, epoch+1)
-        writer.add_scalar("Train/LearningRate", current_lr, epoch+1)
-        writer.add_scalar("Valid/Loss", valid_loss, epoch+1)
-        for key, value in valid_metrics.items():
-            writer.add_scalar("Valid/" + key, value, epoch+1)
-
-        # Check for learning rate saturation
-        lr_stopping(valid_metrics["F1-score"], model, current_lr)
-        if lr_stopping.early_stop:
-            logging.info(f"Training stopped at epoch {epoch+1} due to learning rate saturation or performance plateau")
-            break
-
-        if valid_metrics["F1-score"] > best_f1:
-            best_f1 = valid_metrics["F1-score"]
-
-    
-    logging.info(f"Iteration {iteration_num+1} completed with best F1: {best_f1:.4f}")
-    writer.flush()
-    writer.close()
-    
-    return best_f1, log_dir
-
-
-def main(args):
-    """Main training loop with multiple iterations until learning rate saturation"""
-    
-    overall_log_dir = args.log_dir
-    os.makedirs(overall_log_dir, exist_ok=True)
-    
-    # Overall logging
-    overall_logger = logging.getLogger('overall')
-    overall_logger.setLevel(logging.INFO)
-    handler = logging.FileHandler(os.path.join(overall_log_dir, "overall_training.log"), mode='w')
-    formatter = logging.Formatter("%(asctime)s %(levelname)s: %(message)s", "%F %T")
-    handler.setFormatter(formatter)
-    overall_logger.addHandler(handler)
-    
-    overall_logger.info("Starting multiple training iterations until learning rate saturation")
-    overall_logger.info(f"T6SE data: {args.t6se_data_path}")
-    overall_logger.info(f"Non-T6SE data: {args.non_t6se_data_path}")
-    overall_logger.info(f"Sampling {args.n_t6se_samples} T6SE and {args.n_non_t6se_samples} non-T6SE per iteration")
-
-    iteration = 0
-    all_f1_scores = []
-    
-    while iteration < args.max_iterations:
-        overall_logger.info(f"\n=== Starting Iteration {iteration+1} ===")
+    Args:
+        log_dir (str): Directory for log files
+        process_id (int): Process identifier for this training run
         
+    Returns:
+        logging.Logger: Configured logger instance
+    """
+    os.makedirs(log_dir, exist_ok=True)
+    
+    # Configure logging
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s - %(levelname)s - %(message)s',
+        handlers=[
+            logging.FileHandler(os.path.join(log_dir, f'training_process_{process_id+1}.log')),
+            logging.StreamHandler(sys.stdout)
+        ]
+    )
+    
+    logger = logging.getLogger(__name__)
+    return logger
+
+
+def validate_computational_environment() -> Dict[str, Any]:
+    """
+    Validate and report computational environment specifications.
+    
+    Returns:
+        Dict[str, Any]: Environment specifications
+    """
+    env_info = {
+        'pytorch_version': torch.__version__,
+        'cuda_available': torch.cuda.is_available(),
+        'device_count': torch.cuda.device_count() if torch.cuda.is_available() else 0,
+        'python_version': sys.version,
+    }
+    
+    if torch.cuda.is_available():
+        env_info['gpu_name'] = torch.cuda.get_device_name(0)
+        env_info['gpu_memory_gb'] = torch.cuda.get_device_properties(0).total_memory / 1e9
+        env_info['compute_capability'] = f"{torch.cuda.get_device_properties(0).major}.{torch.cuda.get_device_properties(0).minor}"
+    
+    return env_info
+
+
+def get_current_learning_rate(optimizer: torch.optim.Optimizer) -> float:
+    """
+    Extract current learning rate from optimizer.
+    
+    Args:
+        optimizer (torch.optim.Optimizer): Training optimizer
+        
+    Returns:
+        float: Current learning rate
+    """
+    return optimizer.param_groups[0]['lr']
+
+
+def execute_single_fold_training(
+    model: nn.Module,
+    train_loader: DataLoader,
+    valid_loader: DataLoader,
+    criterion: nn.Module,
+    optimizer: torch.optim.Optimizer,
+    scheduler: torch.optim.lr_scheduler._LRScheduler,
+    early_stopping: EarlyStopping,
+    device: torch.device,
+    config: argparse.Namespace,
+    process_id: int,
+    fold_id: int,
+    writer: SummaryWriter,
+    logger: logging.Logger
+) -> float:
+    """
+    Execute training for a single fold of cross-validation.
+    
+    Args:
+        model (nn.Module): Neural network model
+        train_loader (DataLoader): Training data loader
+        valid_loader (DataLoader): Validation data loader
+        criterion (nn.Module): Loss function
+        optimizer (torch.optim.Optimizer): Optimization algorithm
+        scheduler (torch.optim.lr_scheduler._LRScheduler): Learning rate scheduler
+        early_stopping (EarlyStopping): Early stopping callback
+        device (torch.device): Computation device
+        config (argparse.Namespace): Training configuration
+        process_id (int): Process identifier
+        fold_id (int): Fold identifier
+        writer (SummaryWriter): TensorBoard writer
+        logger (logging.Logger): Logger instance
+        
+    Returns:
+        float: Best F1 score achieved during training
+    """
+    fold_start_time = time.time()
+    experiment_id = process_id * config.kfold + fold_id + 1
+    
+    logger.info(f"Starting Experiment {experiment_id}: Process {process_id+1}, Fold {fold_id+1}")
+    logger.info(f"Training samples: {len(train_loader.dataset)}, "
+                f"Validation samples: {len(valid_loader.dataset)}")
+    
+    best_f1_score = 0.0
+    training_history = []
+    
+    for epoch in range(config.max_epochs):
+        epoch_start_time = time.time()
+        
+        # Training phase
+        train_loss, train_accuracy = train(model, train_loader, criterion, optimizer, device)
+        
+        # Validation phase
+        valid_loss, valid_metrics = test(model, valid_loader, criterion, device)
+        
+        # Learning rate scheduling
+        current_lr = get_current_learning_rate(optimizer)
+        scheduler.step()
+        
+        epoch_duration = time.time() - epoch_start_time
+        
+        # Record training history
+        epoch_record = {
+            'epoch': epoch + 1,
+            'train_loss': train_loss,
+            'train_accuracy': train_accuracy,
+            'valid_loss': valid_loss,
+            'valid_metrics': valid_metrics,
+            'learning_rate': current_lr,
+            'duration_seconds': epoch_duration
+        }
+        training_history.append(epoch_record)
+        
+        # Log progress
+        if (epoch + 1) % 10 == 0 or valid_metrics['F1-score'] > best_f1_score:
+            logger.info(f"Experiment {experiment_id}, Epoch {epoch+1}: "
+                       f"F1={valid_metrics['F1-score']:.4f}, "
+                       f"Accuracy={valid_metrics['Accuracy']:.4f}, "
+                       f"LR={current_lr:.2e}")
+        
+        # TensorBoard logging
+        writer.add_scalar("Training/Loss", train_loss, epoch + 1)
+        writer.add_scalar("Training/Accuracy", train_accuracy, epoch + 1)
+        writer.add_scalar("Training/LearningRate", current_lr, epoch + 1)
+        writer.add_scalar("Validation/Loss", valid_loss, epoch + 1)
+        
+        for metric_name, metric_value in valid_metrics.items():
+            writer.add_scalar(f"Validation/{metric_name}", metric_value, epoch + 1)
+        
+        # Update best performance
+        if valid_metrics['F1-score'] > best_f1_score:
+            best_f1_score = valid_metrics['F1-score']
+            logger.info(f"New best F1 score achieved: {best_f1_score:.4f}")
+        
+        # Early stopping check
+        early_stopping(valid_metrics['F1-score'], model)
+        if early_stopping.early_stop:
+            logger.info(f"Early stopping triggered at epoch {epoch+1}")
+            break
+    
+    fold_duration = time.time() - fold_start_time
+    logger.info(f"Experiment {experiment_id} completed: "
+               f"Best F1={best_f1_score:.4f}, "
+               f"Duration={fold_duration/60:.1f} minutes")
+    
+    return best_f1_score
+
+
+def execute_cross_validation_protocol(config: argparse.Namespace) -> None:
+    """
+    Execute the complete cross-validation training protocol.
+    
+    Args:
+        config (argparse.Namespace): Training configuration parameters
+    """
+    # Initialize logging
+    process_log_dir = os.path.join(config.log_dir, f'Process_{config.process_id+1}')
+    logger = setup_logging(process_log_dir, config.process_id)
+    
+    # Validate environment
+    env_info = validate_computational_environment()
+    logger.info("=" * 80)
+    logger.info("COMPUTATIONAL ENVIRONMENT VALIDATION")
+    logger.info("=" * 80)
+    for key, value in env_info.items():
+        logger.info(f"{key}: {value}")
+    
+    # Set process-specific random seed
+    process_seed = config.seed + config.process_id * 100
+    set_seed(process_seed)
+    logger.info(f"Random seed set to: {process_seed}")
+    
+    # Device configuration
+    device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+    logger.info(f"Computation device: {device}")
+    
+    if device.type == 'cpu':
+        logger.warning("CUDA not available - training will proceed on CPU (significantly slower)")
+    else:
+        logger.info(f"GPU acceleration enabled: {torch.cuda.get_device_name(0)}")
+    
+    # Initialize TensorBoard logging
+    writer = SummaryWriter(process_log_dir)
+    
+    # Log experimental configuration
+    logger.info("=" * 80)
+    logger.info("EXPERIMENTAL CONFIGURATION")
+    logger.info("=" * 80)
+    logger.info(f"Model architecture: {config.model}")
+    logger.info(f"Process identifier: {config.process_id + 1}")
+    logger.info(f"Cross-validation folds: {config.kfold}")
+    logger.info(f"T6SE samples per process: {config.n_t6se_samples}")
+    logger.info(f"Non-T6SE samples per process: {config.n_non_t6se_samples}")
+    logger.info(f"Maximum epochs per fold: {config.max_epochs}")
+    logger.info(f"Batch size: {config.batch_size}")
+    logger.info(f"Learning rate: {config.lr}")
+    logger.info(f"Early stopping patience: {config.patience}")
+    logger.info("=" * 80)
+    
+    # Initialize results storage
+    fold_performance_scores = []
+    alphabet = Alphabet.from_architecture("roberta_large")
+    
+    # Execute k-fold cross-validation
+    for fold_idx in range(config.kfold):
+        logger.info(f"Initiating fold {fold_idx+1}/{config.kfold}")
+        
+        # Dataset preparation
         try:
-            best_f1, iteration_log_dir = run_single_training_iteration(args, iteration)
-            all_f1_scores.append(best_f1)
+            train_dataset = TXSESequenceDataSet(
+                t6se_fasta_path=config.t6se_data_path,
+                non_t6se_fasta_path=config.non_t6se_data_path,
+                transform=label2index,
+                mode='train',
+                kfold=config.kfold,
+                fold_num=fold_idx,
+                seed=process_seed,
+                n_t6se_samples=config.n_t6se_samples,
+                n_non_t6se_samples=config.n_non_t6se_samples
+            )
             
-            overall_logger.info(f"Iteration {iteration+1} completed - Best F1: {best_f1:.4f}")
+            valid_dataset = TXSESequenceDataSet(
+                t6se_fasta_path=config.t6se_data_path,
+                non_t6se_fasta_path=config.non_t6se_data_path,
+                transform=label2index,
+                mode='valid',
+                kfold=config.kfold,
+                fold_num=fold_idx,
+                seed=process_seed,
+                n_t6se_samples=config.n_t6se_samples,
+                n_non_t6se_samples=config.n_non_t6se_samples
+            )
             
-            # Check if we should continue (you can add more sophisticated stopping criteria here)
-            if len(all_f1_scores) >= 3:
-                recent_scores = all_f1_scores[-3:]
-                score_improvement = max(recent_scores) - min(recent_scores)
-                if score_improvement < args.convergence_threshold:
-                    overall_logger.info(f"Performance converged (improvement < {args.convergence_threshold}). Stopping.")
-                    break
-            
-            iteration += 1
+            logger.info(f"Datasets created - Train: {len(train_dataset)}, "
+                       f"Validation: {len(valid_dataset)}")
             
         except Exception as e:
-            overall_logger.error(f"Error in iteration {iteration+1}: {str(e)}")
-            break
+            logger.error(f"Dataset creation failed for fold {fold_idx+1}: {e}")
+            continue
+        
+        # Data loader preparation
+        train_loader = DataLoader(
+            train_dataset,
+            batch_size=config.batch_size,
+            collate_fn=alphabet.get_batch_converter(),
+            num_workers=config.num_workers,
+            shuffle=True
+        )
+        
+        valid_loader = DataLoader(
+            valid_dataset,
+            batch_size=config.batch_size,
+            collate_fn=alphabet.get_batch_converter(),
+            num_workers=config.num_workers,
+            shuffle=False
+        )
+        
+        # Model initialization
+        if config.model == "effectortransformer":
+            model = EffectorTransformer(
+                emb_dim=1280,
+                repr_layer=33,
+                hid_dim=config.hid_dim,
+                num_layers=config.num_layers,
+                heads=config.num_heads,
+                dropout_rate=config.dropout_rate,
+                num_classes=1
+            )
+        elif config.model == "esm1bmodel":
+            model = ESM1bModel(
+                emb_dim=1280,
+                repr_layer=33,
+                unfreeze_last=True,
+                hid_dim=config.hid_dim,
+                dropout_rate=config.dropout_rate,
+                num_classes=1
+            )
+        else:
+            raise ValueError(f"Unsupported model architecture: {config.model}")
+        
+        model.to(device)
+        logger.info(f"Model initialized and transferred to {device}")
+        
+        # Optimization setup
+        criterion = nn.BCEWithLogitsLoss()
+        
+        if config.model == "esm1bmodel" and hasattr(model, 'pretrained_model'):
+            optimizer = optim.Adam([
+                {'params': filter(lambda p: p.requires_grad, model.pretrained_model.parameters()),
+                 'lr': config.lr / 10},
+                {'params': model.clf.parameters(), 'lr': config.lr}
+            ], weight_decay=config.weight_decay)
+        else:
+            optimizer = optim.Adam(model.parameters(), lr=config.lr, weight_decay=config.weight_decay)
+        
+        # Learning rate scheduling
+        if config.lr_scheduler == 'cosine':
+            after_scheduler = lrs.CosineAnnealingLR(
+                optimizer,
+                T_max=config.lr_decay_steps,
+                eta_min=config.lr_decay_min_lr
+            )
+        elif config.lr_scheduler == 'step':
+            after_scheduler = lrs.StepLR(
+                optimizer,
+                step_size=config.lr_decay_steps,
+                gamma=config.lr_decay_rate
+            )
+        else:
+            after_scheduler = None
+        
+        if after_scheduler is not None:
+            scheduler = GradualWarmupScheduler(
+                optimizer,
+                multiplier=1,
+                total_epoch=config.warm_epochs,
+                after_scheduler=after_scheduler
+            )
+        else:
+            scheduler = GradualWarmupScheduler(
+                optimizer,
+                multiplier=1,
+                total_epoch=config.warm_epochs
+            )
+        
+        # Early stopping configuration
+        fold_checkpoint_dir = os.path.join(process_log_dir, f'Fold_{fold_idx+1}')
+        early_stopping = EarlyStopping(patience=config.patience, checkpoint_dir=fold_checkpoint_dir)
+        
+        # Execute training for current fold
+        fold_f1_score = execute_single_fold_training(
+            model=model,
+            train_loader=train_loader,
+            valid_loader=valid_loader,
+            criterion=criterion,
+            optimizer=optimizer,
+            scheduler=scheduler,
+            early_stopping=early_stopping,
+            device=device,
+            config=config,
+            process_id=config.process_id,
+            fold_id=fold_idx,
+            writer=writer,
+            logger=logger
+        )
+        
+        fold_performance_scores.append(fold_f1_score)
+        
+        # Memory cleanup
+        if device.type == 'cuda':
+            del model
+            torch.cuda.empty_cache()
     
-    overall_logger.info(f"\nTraining completed after {iteration+1} iterations")
-    overall_logger.info(f"All F1 scores: {all_f1_scores}")
+    # Close TensorBoard writer
+    writer.close()
     
-    # --- PATCH START: Prevent crash when all_f1_scores is empty ---
-    if all_f1_scores:
-        overall_logger.info(f"Best F1 score: {max(all_f1_scores):.4f}")
-        overall_logger.info(f"Mean F1 score: {sum(all_f1_scores)/len(all_f1_scores):.4f}")
+    # Compute and report final statistics
+    if fold_performance_scores:
+        mean_f1 = np.mean(fold_performance_scores)
+        std_f1 = np.std(fold_performance_scores)
+        min_f1 = np.min(fold_performance_scores)
+        max_f1 = np.max(fold_performance_scores)
+        
+        logger.info("=" * 80)
+        logger.info("CROSS-VALIDATION RESULTS SUMMARY")
+        logger.info("=" * 80)
+        logger.info(f"Process {config.process_id + 1} Performance Statistics:")
+        logger.info(f"Individual fold F1 scores: {[f'{score:.4f}' for score in fold_performance_scores]}")
+        logger.info(f"Mean F1 score: {mean_f1:.4f} ± {std_f1:.4f}")
+        logger.info(f"Performance range: [{min_f1:.4f}, {max_f1:.4f}]")
+        logger.info(f"Coefficient of variation: {(std_f1/mean_f1)*100:.2f}%")
+        logger.info("=" * 80)
+        
+        # Save results to file
+        results_file = os.path.join(process_log_dir, "cross_validation_results.txt")
+        with open(results_file, 'w') as f:
+            f.write(f"Cross-Validation Results - Process {config.process_id + 1}\n")
+            f.write(f"{'='*50}\n")
+            f.write(f"Random seed: {process_seed}\n")
+            f.write(f"Individual fold F1 scores: {fold_performance_scores}\n")
+            f.write(f"Mean F1 score: {mean_f1:.4f}\n")
+            f.write(f"Standard deviation: {std_f1:.4f}\n")
+            f.write(f"Minimum F1 score: {min_f1:.4f}\n")
+            f.write(f"Maximum F1 score: {max_f1:.4f}\n")
+            f.write(f"Performance range: {max_f1 - min_f1:.4f}\n")
+            f.write(f"Coefficient of variation: {(std_f1/mean_f1)*100:.2f}%\n")
+        
+        logger.info(f"Results saved to: {results_file}")
     else:
-        overall_logger.warning("No F1 scores recorded — all training iterations may have failed.")
-    # --- PATCH END ---
+        logger.error("No successful fold completions - unable to compute statistics")
+
+
+def parse_arguments() -> argparse.Namespace:
+    """
+    Parse command-line arguments for the training script.
+    
+    Returns:
+        argparse.Namespace: Parsed arguments
+    """
+    parser = argparse.ArgumentParser(
+        description="Deep Learning Framework for T6SE Classification",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter
+    )
+    
+    # Data and model configuration
+    parser.add_argument('--model', type=str, required=True,
+                       choices=['effectortransformer', 'esm1bmodel'],
+                       help='Neural network architecture for classification')
+    parser.add_argument('--t6se_data_path', type=str, required=True,
+                       help='Path to T6SE protein sequences (FASTA format)')
+    parser.add_argument('--non_t6se_data_path', type=str, required=True,
+                       help='Path to non-T6SE protein sequences (FASTA format)')
+    parser.add_argument('--log_dir', type=str, default='./experimental_logs',
+                       help='Directory for experimental logs and outputs')
+    
+    # Training hyperparameters
+    parser.add_argument('--batch_size', type=int, default=32,
+                       help='Training batch size')
+    parser.add_argument('--lr', type=float, default=5e-5,
+                       help='Initial learning rate')
+    parser.add_argument('--warm_epochs', type=int, default=10,
+                       help='Learning rate warmup epochs')
+    parser.add_argument('--max_epochs', type=int, default=100,
+                       help='Maximum training epochs per fold')
+    parser.add_argument('--num_workers', type=int, default=4,
+                       help='Number of data loading workers')
+    parser.add_argument('--weight_decay', type=float, default=4e-5,
+                       help='L2 regularization coefficient')
+    
+    # Sampling configuration
+    parser.add_argument('--n_t6se_samples', type=int, default=240,
+                       help='Number of T6SE samples per process')
+    parser.add_argument('--n_non_t6se_samples', type=int, default=300,
+                       help='Number of non-T6SE samples per process')
+    
+    # Cross-validation parameters
+    parser.add_argument('--process_id', type=int, required=True,
+                       help='Process identifier (0-based indexing)')
+    parser.add_argument('--kfold', type=int, default=5,
+                       help='Number of cross-validation folds')
+    
+    # Optimization and scheduling
+    parser.add_argument('--patience', type=int, default=15,
+                       help='Early stopping patience (epochs)')
+    parser.add_argument('--lr_scheduler', type=str, default='cosine',
+                       choices=['cosine', 'step'],
+                       help='Learning rate scheduling strategy')
+    parser.add_argument('--lr_decay_steps', type=int, default=50,
+                       help='Learning rate decay interval')
+    parser.add_argument('--lr_decay_rate', type=float, default=0.1,
+                       help='Learning rate decay factor')
+    parser.add_argument('--lr_decay_min_lr', type=float, default=1e-7,
+                       help='Minimum learning rate threshold')
+    
+    # Model architecture parameters
+    parser.add_argument('--hid_dim', type=int, default=512,
+                       help='Hidden layer dimensionality')
+    parser.add_argument('--num_layers', type=int, default=1,
+                       help='Number of transformer layers')
+    parser.add_argument('--num_heads', type=int, default=4,
+                       help='Number of attention heads')
+    parser.add_argument('--dropout_rate', type=float, default=0.4,
+                       help='Dropout probability')
+    
+    # Reproducibility
+    parser.add_argument('--seed', type=int, default=42,
+                       help='Random seed for reproducibility')
+    
+    return parser.parse_args()
+
+
+def main():
+    """Main execution function."""
+    # Parse command line arguments
+    config = parse_arguments()
+    
+    # Validate input files
+    if not os.path.exists(config.t6se_data_path):
+        raise FileNotFoundError(f"T6SE data file not found: {config.t6se_data_path}")
+    if not os.path.exists(config.non_t6se_data_path):
+        raise FileNotFoundError(f"Non-T6SE data file not found: {config.non_t6se_data_path}")
+    
+    # Execute cross-validation protocol
+    execute_cross_validation_protocol(config)
 
 
 if __name__ == "__main__":
-    parser = ArgumentParser(description="Train binary classifier for T6SE vs non-T6SE prediction with random sampling.")
-    
-    # Model and data arguments
-    parser.add_argument('--model', type=str, choices=['effectortransformer', 'esm1bmodel'], required=True)
-    parser.add_argument('--t6se_data_path', type=str, required=True, help='Path to T6SE FASTA file')
-    parser.add_argument('--non_t6se_data_path', type=str, required=True, help='Path to non-T6SE FASTA file (non-secretory + T1SE + T2SE + T3SE + T4SE)')
-    parser.add_argument('--log_dir', type=str, default='./logs')
-    
-    # Training arguments
-    parser.add_argument('--batch_size', type=int, default=32)
-    parser.add_argument('--lr', type=float, default=5e-5)
-    parser.add_argument('--warm_epochs', type=int, default=1)
-    parser.add_argument('--max_epochs', type=int, default=200)
-    parser.add_argument('--max_iterations', type=int, default=50, help='Maximum number of training iterations')
-    parser.add_argument('--num_workers', type=int, default=4)
-    parser.add_argument('--weight_decay', type=float, default=4e-5)
-    
-    # Sampling arguments
-    parser.add_argument('--n_t6se_samples', type=int, default=240, help='Number of T6SE samples per iteration')
-    parser.add_argument('--n_non_t6se_samples', type=int, default=300, help='Number of non-T6SE samples per iteration')
-    
-    # Cross-validation arguments
-    parser.add_argument('--fold_num', type=int, default=0)
-    parser.add_argument('--kfold', type=int, default=5)
-    
-    # Learning rate and stopping arguments
-    parser.add_argument('--patience', type=int, default=5)
-    parser.add_argument('--min_lr_threshold', type=float, default=1e-6, help='Minimum LR threshold for saturation')
-    parser.add_argument('--convergence_threshold', type=float, default=0.01, help='F1 improvement threshold for convergence')
-    parser.add_argument('--lr_scheduler', type=str, default='cosine', choices=['cosine', 'step', None])
-    parser.add_argument('--lr_decay_steps', type=int, default=30)
-    parser.add_argument('--lr_decay_rate', type=float, default=0.1)
-    parser.add_argument('--lr_decay_min_lr', type=float, default=1e-6)
-    
-    # Model architecture arguments
-    parser.add_argument('--hid_dim', type=int, default=512)
-    parser.add_argument('--num_layers', type=int, default=1)
-    parser.add_argument('--num_heads', type=int, default=4)
-    parser.add_argument('--dropout_rate', type=float, default=0.4)
-    
-    # Seed
-    parser.add_argument('--seed', type=int, default=42)
-    
-    args = parser.parse_args()
-    main(args)
+    main()
